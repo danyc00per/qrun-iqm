@@ -1,4 +1,3 @@
 fastapi
 uvicorn[standard]
-qiskit>=1.2,<2
-qiskit-iqm>=15
+iqm-client[qiskit]

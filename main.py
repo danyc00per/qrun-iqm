@@ -24,11 +24,21 @@
 
 import os
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 app = FastAPI()
 
-COCOS = "https://cocos.resonance.meetiqm.com"   # IQM Resonance job server
+# Allow browser calls (the QRUN app + local test pages). The real protection is
+# the QRUN_IQM_KEY shared-key header, not the browser origin, so "*" is fine here.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+RESONANCE = "https://resonance.meetiqm.com"      # IQM Resonance server (iqm-client API)
 DEFAULT_DEVICE = "garnet:mock"                   # safe default — never spends credits
 MAX_QASM_CHARS = 20_000
 MAX_QUBITS = 20                                  # Garnet = 20 qubits
@@ -68,20 +78,19 @@ def iqm_run(req: IQMRunRequest, x_qrun_key: str | None = Header(default=None)):
     try:
         # Imported inside the handler so a health check never fails if the heavy
         # quantum stack has an import hiccup at boot.
-        from qiskit import transpile
         from qiskit.qasm3 import loads
-        from iqm.qiskit_iqm import IQMProvider
+        from iqm.qiskit_iqm import IQMProvider, transpile_to_IQM
 
         circuit = loads(req.qasm)              # parse OpenQASM 3
         if circuit.num_qubits > MAX_QUBITS:
             return {"ok": False, "error": f"circuit too large ({circuit.num_qubits} qubits > {MAX_QUBITS})"}
 
-        url = f"{COCOS}/{device}"
-        backend = IQMProvider(url, token=token).get_backend()
-
-        # Standard Qiskit transpile — the IQM plugin auto-adapts to native gates
-        # (r, cz) and inserts MOVE gates for resonator architectures if needed.
-        transpiled = transpile(circuit, backend=backend, optimization_level=1)
+        # New iqm-client API: single Resonance URL + quantum_computer selects the
+        # device (e.g. "garnet:mock"). transpile_to_IQM adapts to IQM native gates
+        # (r, cz) and inserts MOVE gates for resonator architectures as needed.
+        provider = IQMProvider(RESONANCE, quantum_computer=device, token=token)
+        backend = provider.get_backend()
+        transpiled = transpile_to_IQM(circuit, backend)
 
         job = backend.run(transpiled, shots=shots)   # submit to IQM
         result = job.result()                        # blocks until finished
