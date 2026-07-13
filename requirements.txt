@@ -1,3 +1,4 @@
 fastapi
 uvicorn[standard]
-qiskit-iqm
+qiskit>=1.2,<2
+qiskit-iqm>=15
