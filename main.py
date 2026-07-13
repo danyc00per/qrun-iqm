@@ -107,3 +107,88 @@ def iqm_run(req: IQMRunRequest, x_qrun_key: str | None = Header(default=None)):
         raise
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+# ── Async path (submit → poll) — needed for the real Garnet queue ────────────
+# /iqm/run above blocks until done: fine for mock and quick jobs, but the real
+# device has a queue that can exceed HTTP timeouts. These two endpoints let the
+# caller submit, get a job_id back immediately, then poll for the result.
+
+class IQMSubmitRequest(BaseModel):
+    qasm: str = Field(max_length=MAX_QASM_CHARS)
+    shots: int = 1024
+    device: str = DEFAULT_DEVICE
+
+
+class IQMStatusRequest(BaseModel):
+    job_id: str
+    device: str = DEFAULT_DEVICE
+
+
+def _check_key(x_qrun_key):
+    expected = os.environ.get("QRUN_IQM_KEY", "").strip()
+    if expected and (x_qrun_key or "").strip() != expected:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _backend(device, token):
+    from iqm.qiskit_iqm import IQMProvider
+    return IQMProvider(RESONANCE, quantum_computer=device, token=token).get_backend()
+
+
+@app.post("/iqm/submit")
+def iqm_submit(req: IQMSubmitRequest, x_qrun_key: str | None = Header(default=None)):
+    _check_key(x_qrun_key)
+    token = os.environ.get("IQM_RESONANCE_TOKEN", "").strip()
+    if not token:
+        return {"ok": False, "error": "IQM_RESONANCE_TOKEN not configured on the service"}
+    device = req.device if req.device in ALLOWED_DEVICES else DEFAULT_DEVICE
+    shots = max(1, min(int(req.shots or 1024), MAX_SHOTS))
+    try:
+        from qiskit.qasm3 import loads
+        from iqm.qiskit_iqm import transpile_to_IQM
+        circuit = loads(req.qasm)
+        if circuit.num_qubits > MAX_QUBITS:
+            return {"ok": False, "error": f"circuit too large ({circuit.num_qubits} qubits > {MAX_QUBITS})"}
+        backend = _backend(device, token)
+        transpiled = transpile_to_IQM(circuit, backend)
+        job = backend.run(transpiled, shots=shots)   # submits, returns immediately (no blocking)
+        return {"ok": True, "job_id": job.job_id(), "device": device, "shots": shots, "num_qubits": circuit.num_qubits}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/iqm/status")
+def iqm_status(req: IQMStatusRequest, x_qrun_key: str | None = Header(default=None)):
+    _check_key(x_qrun_key)
+    token = os.environ.get("IQM_RESONANCE_TOKEN", "").strip()
+    if not token:
+        return {"ok": False, "error": "IQM_RESONANCE_TOKEN not configured on the service"}
+    device = req.device if req.device in ALLOWED_DEVICES else DEFAULT_DEVICE
+    try:
+        backend = _backend(device, token)
+        # Reconstruct the job handle from its id. Try the backend helper first,
+        # fall back to constructing an IQMJob directly.
+        job = None
+        try:
+            job = backend.retrieve_job(req.job_id)
+        except Exception:
+            from iqm.qiskit_iqm.iqm_job import IQMJob
+            job = IQMJob(backend, job_id=req.job_id)
+
+        st = job.status()
+        name = getattr(st, "name", str(st)).upper()
+
+        if name in ("DONE", "COMPLETED"):
+            counts = job.result().get_counts()
+            return {"ok": True, "status": "done", "counts": counts, "device": device}
+        if name in ("ERROR", "FAILED", "CANCELLED"):
+            return {"ok": True, "status": "failed", "counts": None, "device": device, "detail": name}
+        # INITIALIZING / QUEUED / VALIDATING / RUNNING → still pending
+        return {"ok": True, "status": "pending", "phase": name, "counts": None, "device": device}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
