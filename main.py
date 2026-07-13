@@ -41,11 +41,14 @@ app.add_middleware(
 RESONANCE = "https://resonance.meetiqm.com"      # IQM Resonance server (iqm-client API)
 DEFAULT_DEVICE = "garnet:mock"                   # safe default — never spends credits
 MAX_QASM_CHARS = 20_000
-MAX_QUBITS = 20                                  # Garnet = 20 qubits
+MAX_QUBITS = 54                                  # Emerald = 54 (max across machines)
 MAX_SHOTS = 20_000
 ALLOWED_DEVICES = {
     "garnet", "garnet:mock", "garnet:timeslot",
     "emerald", "emerald:mock", "emerald:timeslot",
+    # Sirius (Star topology + MOVE gates) intentionally NOT enabled — Crystal
+    # machines (Garnet/Emerald) cover our needs with simpler, more reliable
+    # transpilation. Add sirius here + in _lib/iqm.js IQM_DEVICES to re-enable.
 }
 
 
