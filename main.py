@@ -253,6 +253,10 @@ def oq_submit(req: OQSubmitRequest, x_qrun_key: str | None = Header(default=None
         config = JobSubmissionConfig(
             backend_class_id=backend_id,
             name="QRUN job",
+            # Required by the SDK: a job category tag. It does not affect the
+            # computation or cost — it's just metadata Open Quantum records. The
+            # env override lets us change it without a redeploy if needed.
+            job_subcategory_id=os.environ.get("OPENQUANTUM_SUBCATEGORY", "fin:port"),
             shots=shots,
             execution_plan="auto",
             queue_priority="auto",
