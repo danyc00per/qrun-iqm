@@ -265,6 +265,59 @@ def _oq_org_id():
     return _OQ_ORG_ID
 
 
+@app.get("/oq/jobs")
+def oq_jobs(x_qrun_key: str | None = Header(default=None)):
+    # List recent Open Quantum jobs with their id + status, so we don't have to
+    # hunt for a job_id by hand. Read-only, no credits spent.
+    _check_key(x_qrun_key)
+    try:
+        scheduler = _oq_scheduler()
+        org_id = _oq_org_id()
+        try:
+            page = scheduler.list_jobs(organization_id=org_id)
+        except TypeError:
+            page = scheduler.list_jobs()
+        jobs = getattr(page, "jobs", None) or getattr(page, "items", None) or []
+        out = []
+        for j in jobs[:10]:
+            out.append({
+                "id": getattr(j, "id", None),
+                "name": getattr(j, "name", None),
+                "status": getattr(j, "status", None),
+                "created": str(getattr(j, "created_at", "") or getattr(j, "created", "")),
+            })
+        return {"ok": True, "jobs": out}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/oq/inspect")
+def oq_inspect(job_id: str, x_qrun_key: str | None = Header(default=None)):
+    # Diagnostic: dump the RAW status + output of a specific job so we can see
+    # exactly what Open Quantum returns (status string, result shape). Read-only,
+    # no credits spent. Usage: /oq/inspect?job_id=XXXX
+    _check_key(x_qrun_key)
+    try:
+        scheduler = _oq_scheduler()
+        job = scheduler.get_job(job_id)
+        out = {"job_id": job_id}
+        out["raw_status"] = getattr(job, "status", None)
+        out["has_output_url"] = bool(getattr(job, "output_data_url", None))
+        # List the job object's attributes so we see what fields exist
+        out["job_fields"] = [a for a in dir(job) if not a.startswith("_")][:40]
+        # Try to download output and show its shape
+        try:
+            data = scheduler.download_job_output(job)
+            out["output_type"] = type(data).__name__
+            out["output_preview"] = str(data)[:500]
+            out["counts_parsed"] = _oq_counts(data)
+        except Exception as e:
+            out["output_error"] = f"{type(e).__name__}: {e}"
+        return out
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 @app.get("/oq/diag")
 def oq_diag(x_qrun_key: str | None = Header(default=None)):
     # Free diagnostic: checks whether the Open Quantum credentials work and the
