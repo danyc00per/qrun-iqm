@@ -195,3 +195,119 @@ def iqm_status(req: IQMStatusRequest, x_qrun_key: str | None = Header(default=No
         raise
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Open Quantum (Quantum Rings) bridge — Rigetti + AQT real QPUs.
+#
+# Same service, separate code path from IQM: nothing above changes. Open Quantum
+# speaks OpenQASM through its own SDK, which reads OPENQUANTUM_CLIENT_ID/SECRET
+# from the environment. We return the SAME result shape as the IQM endpoints
+# ({"counts": {...}}) so run-job.js and Verdict need no special casing.
+#
+# IonQ is intentionally NOT in ALLOWED_OQ_BACKENDS: one IonQ run (~40+ credits)
+# would drain the whole free Spark balance. The IDE shows it greyed as "blocked";
+# this is the second lock — even a crafted request can't spend on IonQ here.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Map QRUN's friendly device ids → Open Quantum backend_class_id.
+OQ_BACKENDS = {
+    "rigetti":      "rigetti:cepheus-1-108q",
+    "rigetti:cepheus": "rigetti:cepheus-1-108q",
+    "aqt":          "aqt:ibex-q1",
+    "aqt:ibex":     "aqt:ibex-q1",
+}
+OQ_DEFAULT = "rigetti"          # cheapest per run (~0.6 credit)
+MAX_OQ_SHOTS = 4096
+
+
+class OQSubmitRequest(BaseModel):
+    qasm: str = Field(max_length=MAX_QASM_CHARS)
+    shots: int = 1024
+    device: str = OQ_DEFAULT
+
+
+class OQStatusRequest(BaseModel):
+    job_id: str
+
+
+def _oq_scheduler():
+    # Imported inside the handler so a health check never fails if the SDK has an
+    # import hiccup at boot. Credentials come from the environment.
+    from openquantum_sdk.clients import SchedulerClient
+    if not os.environ.get("OPENQUANTUM_CLIENT_ID", "").strip():
+        raise HTTPException(status_code=503, detail="OPENQUANTUM_CLIENT_ID not configured")
+    return SchedulerClient()
+
+
+@app.post("/oq/submit")
+def oq_submit(req: OQSubmitRequest, x_qrun_key: str | None = Header(default=None)):
+    _check_key(x_qrun_key)
+    backend_id = OQ_BACKENDS.get(req.device)
+    if not backend_id:
+        return {"ok": False, "error": f"device '{req.device}' not allowed (IonQ is blocked)"}
+    shots = max(1, min(int(req.shots or 1024), MAX_OQ_SHOTS))
+    try:
+        from openquantum_sdk.clients import JobSubmissionConfig
+        scheduler = _oq_scheduler()
+        config = JobSubmissionConfig(
+            backend_class_id=backend_id,
+            name="QRUN job",
+            shots=shots,
+            execution_plan="auto",
+            queue_priority="auto",
+            auto_approve_quote=True,     # spend Spark credits without an interactive prompt
+        )
+        # submit_job returns a job handle/id immediately; we don't block here so
+        # the real queue can't exceed the HTTP timeout — the caller polls /oq/status.
+        job = scheduler.submit_job(config, file_content=req.qasm.encode("utf-8"))
+        job_id = getattr(job, "id", None) or getattr(job, "job_id", None) or str(job)
+        return {"ok": True, "job_id": str(job_id), "device": req.device}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/oq/status")
+def oq_status(req: OQStatusRequest, x_qrun_key: str | None = Header(default=None)):
+    _check_key(x_qrun_key)
+    try:
+        scheduler = _oq_scheduler()
+        job = scheduler.get_job(req.job_id)
+        raw = (getattr(job, "status", None) or "").upper()
+
+        if raw in ("COMPLETED", "DONE", "SUCCEEDED"):
+            out = scheduler.download_job_output(job)
+            counts = _oq_counts(out)
+            return {"ok": True, "status": "done", "counts": counts}
+        if raw in ("FAILED", "ERROR", "CANCELLED", "REJECTED"):
+            return {"ok": True, "status": "failed", "counts": None, "detail": raw}
+        # QUEUED / RUNNING / PREPARING → still pending
+        return {"ok": True, "status": "pending", "phase": raw, "counts": None}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _oq_counts(out):
+    # Normalize Open Quantum's result payload into { "0101": 512, ... }, the same
+    # shape IQM returns. The SDK may hand back a counts dict directly, or a
+    # results object we dig into — cover the common shapes defensively.
+    if out is None:
+        return None
+    # already a plain dict of bitstring → count
+    if isinstance(out, dict):
+        if "counts" in out and isinstance(out["counts"], dict):
+            return {str(k): int(v) for k, v in out["counts"].items()}
+        # dict that IS the counts
+        if all(isinstance(v, (int, float)) for v in out.values()) and out:
+            return {str(k): int(v) for k, v in out.items()}
+    # object with a .counts or .get_counts()
+    c = getattr(out, "counts", None)
+    if callable(getattr(out, "get_counts", None)):
+        c = out.get_counts()
+    if isinstance(c, dict):
+        return {str(k): int(v) for k, v in c.items()}
+    return None
