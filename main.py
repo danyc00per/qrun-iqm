@@ -374,25 +374,57 @@ def oq_submit(req: OQSubmitRequest, x_qrun_key: str | None = Header(default=None
         return {"ok": False, "error": f"device '{req.device}' not allowed (IonQ is blocked)"}
     shots = max(1, min(int(req.shots or 1024), MAX_OQ_SHOTS))
     try:
-        from openquantum_sdk.clients import JobSubmissionConfig
+        from openquantum_sdk.models import JobPreparationCreate, JobCreate
         scheduler = _oq_scheduler()
-        config = JobSubmissionConfig(
-            organization_id=_oq_org_id(),   # required — without it the API returns 401
+        org_id = _oq_org_id()
+        subcat = os.environ.get("OPENQUANTUM_SUBCATEGORY", "fin:port")
+
+        # LOW-LEVEL non-blocking flow. submit_job() blocks until the job finishes
+        # (it polls to completion) — on a real QPU queue that busts the HTTP
+        # timeout and QRUN sees a false "error". Instead we upload → prepare →
+        # create, which returns as soon as the job is QUEUED. cron-poll then
+        # advances it to done, exactly like the IQM path.
+
+        # 1) Upload the circuit
+        upload_id = scheduler.upload_job_input(file_content=req.qasm.encode("utf-8"))
+
+        # 2) Prepare (validates + prices the job)
+        prep = scheduler.prepare_job(JobPreparationCreate(
+            organization_id=org_id,
             backend_class_id=backend_id,
             name="QRUN job",
-            # Required by the SDK: a job category tag. It does not affect the
-            # computation or cost — it's just metadata Open Quantum records. The
-            # env override lets us change it without a redeploy if needed.
-            job_subcategory_id=os.environ.get("OPENQUANTUM_SUBCATEGORY", "fin:port"),
+            upload_endpoint_id=upload_id,
+            job_subcategory_id=subcat,
             shots=shots,
-            execution_plan="auto",
-            queue_priority="auto",
-            auto_approve_quote=True,     # spend Spark credits without an interactive prompt
-        )
-        # submit_job returns a job handle/id immediately; we don't block here so
-        # the real queue can't exceed the HTTP timeout — the caller polls /oq/status.
-        job = scheduler.submit_job(config, file_content=req.qasm.encode("utf-8"))
-        job_id = getattr(job, "id", None) or getattr(job, "job_id", None) or str(job)
+            configuration_data={},
+        ))
+
+        # 3) Poll preparation until the quote is ready (fast — seconds, not queue time)
+        import time
+        prep_result = None
+        for _ in range(60):                     # up to ~60s for pricing
+            prep_result = scheduler.get_preparation_result(prep.id)
+            st = getattr(prep_result, "status", "")
+            if st in ("Completed", "Failed"):
+                break
+            time.sleep(1)
+        if not prep_result or getattr(prep_result, "status", "") != "Completed":
+            msg = getattr(prep_result, "message", None) or "preparation did not complete"
+            return {"ok": False, "error": f"prepare failed: {msg}"}
+
+        # 4) Pick cheapest plan + priority from the quote
+        quote = prep_result.quote
+        cheapest_plan = min(quote, key=lambda p: p.price)
+        cheapest_prio = min(cheapest_plan.queue_priorities, key=lambda q: q.price_increase)
+
+        # 5) Create the job — this deducts credits and QUEUES it, then returns now
+        job_resp = scheduler.create_job(JobCreate(
+            organization_id=org_id,
+            job_preparation_id=prep.id,
+            execution_plan_id=cheapest_plan.execution_plan_id,
+            queue_priority_id=cheapest_prio.queue_priority_id,
+        ))
+        job_id = getattr(job_resp, "id", None) or getattr(job_resp, "job_id", None) or str(job_resp)
         return {"ok": True, "job_id": str(job_id), "device": req.device}
     except HTTPException:
         raise
@@ -412,7 +444,7 @@ def oq_status(req: OQStatusRequest, x_qrun_key: str | None = Header(default=None
             out = scheduler.download_job_output(job)
             counts = _oq_counts(out)
             return {"ok": True, "status": "done", "counts": counts}
-        if raw in ("FAILED", "ERROR", "CANCELLED", "REJECTED"):
+        if raw in ("FAILED", "ERROR", "CANCELLED", "CANCELED", "REJECTED"):
             return {"ok": True, "status": "failed", "counts": None, "detail": raw}
         # QUEUED / RUNNING / PREPARING → still pending
         return {"ok": True, "status": "pending", "phase": raw, "counts": None}
