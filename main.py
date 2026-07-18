@@ -235,23 +235,31 @@ class OQStatusRequest(BaseModel):
 # lookup costs a round-trip. Populated lazily on first submit.
 _OQ_ORG_ID = None
 
+def _oq_auth():
+    # EXPLICIT client-credentials auth. The SDK's env auto-load path returns 401
+    # for our key; passing ClientCredentials explicitly is the method that works
+    # (verified via /oq/diag: explicit_auth -> ok, env_autoload -> 401).
+    cid = os.environ.get("OPENQUANTUM_CLIENT_ID", "").strip()
+    sec = os.environ.get("OPENQUANTUM_CLIENT_SECRET", "").strip()
+    if not (cid and sec):
+        raise HTTPException(status_code=503, detail="OPENQUANTUM_CLIENT_ID/SECRET not configured")
+    from openquantum_sdk.auth import ClientCredentials, ClientCredentialsAuth
+    return ClientCredentialsAuth(creds=ClientCredentials(client_id=cid, client_secret=sec))
+
 def _oq_scheduler():
     # Imported inside the handler so a health check never fails if the SDK has an
-    # import hiccup at boot. Credentials come from the environment
-    # (OPENQUANTUM_CLIENT_ID / OPENQUANTUM_CLIENT_SECRET).
+    # import hiccup at boot.
     from openquantum_sdk.clients import SchedulerClient
-    if not os.environ.get("OPENQUANTUM_CLIENT_ID", "").strip():
-        raise HTTPException(status_code=503, detail="OPENQUANTUM_CLIENT_ID not configured")
-    return SchedulerClient()
+    return SchedulerClient(auth=_oq_auth())
 
 def _oq_org_id():
     # The SDK needs the organization_id on every job. Discover it once via the
-    # ManagementClient, then cache. Without it the API rejects submits with 401.
+    # ManagementClient (explicit auth), then cache.
     global _OQ_ORG_ID
     if _OQ_ORG_ID:
         return _OQ_ORG_ID
     from openquantum_sdk.clients import ManagementClient
-    mgmt = ManagementClient()
+    mgmt = ManagementClient(auth=_oq_auth())
     orgs = mgmt.list_user_organizations()
     _OQ_ORG_ID = orgs.organizations[0].id
     return _OQ_ORG_ID
