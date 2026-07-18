@@ -278,34 +278,54 @@ def oq_diag(x_qrun_key: str | None = Header(default=None)):
     out["client_id_shape"] = f"len={len(cid)} starts={cid[:2]} ends={cid[-2:]}" if cid else "empty"
     out["client_secret_shape"] = f"len={len(sec)} starts={sec[:2]} ends={sec[-2:]}" if sec else "empty"
 
-    # Try EXPLICIT auth (not env auto-load) — isolates whether the SDK is reading
-    # the env vars correctly vs the creds themselves being rejected.
-    try:
-        from openquantum_sdk.auth import ClientCredentials, ClientCredentialsAuth
-        from openquantum_sdk.clients import ManagementClient
-        auth = ClientCredentialsAuth(creds=ClientCredentials(client_id=cid, client_secret=sec))
+    # Try MULTIPLE auth methods and report which (if any) succeeds. This isolates
+    # whether the problem is the auth METHOD (env auto-load vs explicit vs JSON
+    # key file) or the credentials themselves.
+    from openquantum_sdk.clients import ManagementClient
+    attempts = {}
+
+    def _try(label, make_mgmt):
         try:
-            mgmt = ManagementClient(auth=auth)
-        except TypeError:
-            # Some SDK versions take the auth differently; fall back to env auto-load.
-            mgmt = ManagementClient()
-        orgs = mgmt.list_user_organizations()
-        names = [getattr(o, "name", "?") for o in orgs.organizations]
-        out["ok"] = True
-        out["stage"] = "org_discovery"
-        out["organizations"] = names
-        out["org_id_found"] = bool(orgs.organizations)
-        return out
-    except Exception as e:
-        out["ok"] = False
-        out["stage"] = "auth_or_org"
-        out["error"] = f"{type(e).__name__}: {e}"
-        # Dig for a richer message the SDK may attach (response body, detail…).
-        for attr in ("response", "body", "detail", "message", "args"):
-            v = getattr(e, attr, None)
-            if v:
-                out[f"error_{attr}"] = str(v)[:300]
-        return out
+            mgmt = make_mgmt()
+            orgs = mgmt.list_user_organizations()
+            names = [getattr(o, "name", "?") for o in orgs.organizations]
+            attempts[label] = {"ok": True, "orgs": names}
+            return names
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            body = None
+            for attr in ("response", "body", "detail", "message"):
+                v = getattr(e, attr, None)
+                if v: body = str(v)[:200]; break
+            attempts[label] = {"ok": False, "error": msg[:200], "body": body}
+            return None
+
+    # Method A: env auto-load (current approach)
+    _try("env_autoload", lambda: ManagementClient())
+
+    # Method B: explicit ClientCredentialsAuth
+    def _explicit():
+        from openquantum_sdk.auth import ClientCredentials, ClientCredentialsAuth
+        auth = ClientCredentialsAuth(creds=ClientCredentials(client_id=cid, client_secret=sec))
+        return ManagementClient(auth=auth)
+    _try("explicit_auth", _explicit)
+
+    # Method C: write a JSON key file and point OPENQUANTUM_SDK_KEY at it
+    def _jsonkey():
+        import json, tempfile
+        p = os.path.join(tempfile.gettempdir(), "oq_sdk_key.json")
+        with open(p, "w") as fh:
+            json.dump({"client_id": cid, "client_secret": sec}, fh)
+        os.environ["OPENQUANTUM_SDK_KEY"] = p
+        return ManagementClient()
+    _try("json_key_file", _jsonkey)
+
+    out["attempts"] = attempts
+    winner = next((k for k, v in attempts.items() if v.get("ok")), None)
+    out["ok"] = bool(winner)
+    out["winning_method"] = winner
+    out["stage"] = "org_discovery" if winner else "auth_all_failed"
+    return out
 
 
 @app.post("/oq/submit")
