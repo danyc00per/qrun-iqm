@@ -321,6 +321,36 @@ def oq_diag(x_qrun_key: str | None = Header(default=None)):
     _try("json_key_file", _jsonkey)
 
     out["attempts"] = attempts
+
+    # Direct hit on the Keycloak token endpoint, bypassing the SDK entirely.
+    # This shows the RAW OAuth response — the real reason (invalid_client,
+    # unauthorized_client, invalid_grant…) instead of the SDK's opaque 401.
+    try:
+        import requests
+        TOKEN_URL = "https://id.openquantum.com/realms/platform/protocol/openid-connect/token"
+        # Try client_secret_post (creds in body) — the most common M2M form.
+        r = requests.post(TOKEN_URL, data={
+            "grant_type": "client_credentials",
+            "client_id": cid,
+            "client_secret": sec,
+        }, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=15)
+        out["oauth_direct_status"] = r.status_code
+        try:
+            out["oauth_direct_body"] = r.json()
+        except Exception:
+            out["oauth_direct_body"] = r.text[:300]
+        # Also try HTTP Basic auth (creds in Authorization header) as fallback.
+        if r.status_code != 200:
+            r2 = requests.post(TOKEN_URL, data={"grant_type": "client_credentials"},
+                               auth=(cid, sec), timeout=15)
+            out["oauth_basic_status"] = r2.status_code
+            try:
+                out["oauth_basic_body"] = r2.json()
+            except Exception:
+                out["oauth_basic_body"] = r2.text[:300]
+    except Exception as e:
+        out["oauth_direct_error"] = f"{type(e).__name__}: {e}"
+
     winner = next((k for k, v in attempts.items() if v.get("ok")), None)
     out["ok"] = bool(winner)
     out["winning_method"] = winner

@@ -3,3 +3,4 @@ uvicorn[standard]
 iqm-client[qiskit]
 qiskit-qasm3-import
 openquantum-sdk
+requests
