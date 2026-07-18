@@ -231,13 +231,61 @@ class OQStatusRequest(BaseModel):
     job_id: str
 
 
+# Cache the discovered organization id across requests — it doesn't change and the
+# lookup costs a round-trip. Populated lazily on first submit.
+_OQ_ORG_ID = None
+
 def _oq_scheduler():
     # Imported inside the handler so a health check never fails if the SDK has an
-    # import hiccup at boot. Credentials come from the environment.
+    # import hiccup at boot. Credentials come from the environment
+    # (OPENQUANTUM_CLIENT_ID / OPENQUANTUM_CLIENT_SECRET).
     from openquantum_sdk.clients import SchedulerClient
     if not os.environ.get("OPENQUANTUM_CLIENT_ID", "").strip():
         raise HTTPException(status_code=503, detail="OPENQUANTUM_CLIENT_ID not configured")
     return SchedulerClient()
+
+def _oq_org_id():
+    # The SDK needs the organization_id on every job. Discover it once via the
+    # ManagementClient, then cache. Without it the API rejects submits with 401.
+    global _OQ_ORG_ID
+    if _OQ_ORG_ID:
+        return _OQ_ORG_ID
+    from openquantum_sdk.clients import ManagementClient
+    mgmt = ManagementClient()
+    orgs = mgmt.list_user_organizations()
+    _OQ_ORG_ID = orgs.organizations[0].id
+    return _OQ_ORG_ID
+
+
+@app.get("/oq/diag")
+def oq_diag(x_qrun_key: str | None = Header(default=None)):
+    # Free diagnostic: checks whether the Open Quantum credentials work and the
+    # organization can be discovered — WITHOUT submitting a job (no credits spent).
+    # Tells us exactly where a 401 comes from: missing env, bad creds, or org lookup.
+    _check_key(x_qrun_key)
+    have_id = bool(os.environ.get("OPENQUANTUM_CLIENT_ID", "").strip())
+    have_secret = bool(os.environ.get("OPENQUANTUM_CLIENT_SECRET", "").strip())
+    out = {"client_id_present": have_id, "client_secret_present": have_secret}
+    if not (have_id and have_secret):
+        out["ok"] = False
+        out["stage"] = "env"
+        out["error"] = "OPENQUANTUM_CLIENT_ID / OPENQUANTUM_CLIENT_SECRET not both set"
+        return out
+    try:
+        from openquantum_sdk.clients import ManagementClient
+        mgmt = ManagementClient()
+        orgs = mgmt.list_user_organizations()
+        names = [getattr(o, "name", "?") for o in orgs.organizations]
+        out["ok"] = True
+        out["stage"] = "org_discovery"
+        out["organizations"] = names
+        out["org_id_found"] = bool(orgs.organizations)
+        return out
+    except Exception as e:
+        out["ok"] = False
+        out["stage"] = "auth_or_org"
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
 
 
 @app.post("/oq/submit")
@@ -251,6 +299,7 @@ def oq_submit(req: OQSubmitRequest, x_qrun_key: str | None = Header(default=None
         from openquantum_sdk.clients import JobSubmissionConfig
         scheduler = _oq_scheduler()
         config = JobSubmissionConfig(
+            organization_id=_oq_org_id(),   # required — without it the API returns 401
             backend_class_id=backend_id,
             name="QRUN job",
             # Required by the SDK: a job category tag. It does not affect the
