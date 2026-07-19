@@ -499,8 +499,15 @@ def oq_status(req: OQStatusRequest, x_qrun_key: str | None = Header(default=None
             return {"ok": True, "status": "done", "counts": counts}
         if raw in ("FAILED", "ERROR", "CANCELLED", "CANCELED", "REJECTED"):
             return {"ok": True, "status": "failed", "counts": None, "detail": raw}
-        # QUEUED / RUNNING / PREPARING → still pending
-        return {"ok": True, "status": "pending", "phase": raw, "counts": None}
+        # QUEUED / RUNNING / PREPARING → still pending. Surface any queue message
+        # the provider attaches (position, "waiting for hardware", etc.) so the
+        # UI can show real progress instead of a generic spinner.
+        msg = getattr(job, "message", None)
+        extra = getattr(job, "extra", None)
+        return {"ok": True, "status": "pending", "phase": raw,
+                "message": str(msg)[:160] if msg else None,
+                "extra": str(extra)[:160] if extra else None,
+                "counts": None}
     except HTTPException:
         raise
     except Exception as e:
