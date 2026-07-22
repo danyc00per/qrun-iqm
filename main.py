@@ -60,15 +60,22 @@ class IQMRunRequest(BaseModel):
 
 @app.get("/")
 def health():
-    have_token = bool(os.environ.get("IQM_RESONANCE_TOKEN", "").strip())
-    return {"ok": True, "service": "qrun-iqm", "status": "alive", "token_configured": have_token}
+    # Deliberately says nothing about credentials: this endpoint is public and
+    # the repo is public, so "is the token armed?" is free reconnaissance.
+    return {"ok": True, "service": "qrun-iqm", "status": "alive"}
 
 
 @app.post("/iqm/run")
 def iqm_run(req: IQMRunRequest, x_qrun_key: str | None = Header(default=None)):
     # Optional shared-key gate (same pattern as the transpiler).
     expected = os.environ.get("QRUN_IQM_KEY", "").strip()
-    if expected and (x_qrun_key or "").strip() != expected:
+    # FAIL CLOSED. The previous form was `if expected and ...`, which meant a
+    # missing or mistyped QRUN_IQM_KEY made the whole service PUBLIC — and this
+    # repo is public, so the endpoints are known. That mattered here more than
+    # anywhere: this bridge submits jobs with the platform's IQM token, and the
+    # monthly credit guard lives in QRUN's run-job.js, not here, so a direct
+    # call bypasses it entirely. No key configured now means nobody gets in.
+    if not expected or (x_qrun_key or "").strip() != expected:
         raise HTTPException(status_code=401, detail="unauthorized")
 
     token = os.environ.get("IQM_RESONANCE_TOKEN", "").strip()
@@ -130,7 +137,13 @@ class IQMStatusRequest(BaseModel):
 
 def _check_key(x_qrun_key):
     expected = os.environ.get("QRUN_IQM_KEY", "").strip()
-    if expected and (x_qrun_key or "").strip() != expected:
+    # FAIL CLOSED. The previous form was `if expected and ...`, which meant a
+    # missing or mistyped QRUN_IQM_KEY made the whole service PUBLIC — and this
+    # repo is public, so the endpoints are known. That mattered here more than
+    # anywhere: this bridge submits jobs with the platform's IQM token, and the
+    # monthly credit guard lives in QRUN's run-job.js, not here, so a direct
+    # call bypasses it entirely. No key configured now means nobody gets in.
+    if not expected or (x_qrun_key or "").strip() != expected:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
