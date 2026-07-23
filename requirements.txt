@@ -1,6 +1,17 @@
-fastapi
-uvicorn[standard]
-iqm-client[qiskit]
-qiskit-qasm3-import
-openquantum-sdk
-requests
+# Versions figées le 2026-07-23 sur ce qui tournait au déploiement du 22/07.
+#
+# POURQUOI : sans pin, chaque rebuild Render réinstalle les dernières versions.
+# iqm-client est passé de 34.0.4 à 35.0.0 le 23/07 — un saut MAJEUR qui serait
+# arrivé en production sans qu'on l'ait testé, sur le seul chemin QPU réel
+# encore ouvert. Un service qui dort et se réveille ne réinstalle rien ; c'est
+# le rebuild qui change tout, et il peut être déclenché par n'importe quel push.
+#
+# POUR METTRE À JOUR PLUS TARD : changer une seule ligne à la fois, redéployer,
+# lancer un run réel. Jamais tout d'un coup.
+
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+iqm-client[qiskit]==34.0.4
+qiskit-qasm3-import==0.6.0
+openquantum-sdk==0.4.0
+requests==2.34.2
